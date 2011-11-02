@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2008 Steinle Solution-Factory GmbH. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#   * Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#   * Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the
+#     distribution.
+#   * Neither the name of Steinle Solution-Factory nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Abstract
+# ~~~~~~~~
+# The dsnapshot script provides a high-level interface to the Linux
+# Logical Volume Manager. It uses its block-level snapshot support to
+# create directory snapshots. In contrast to block-level snapshots,
+# directory snapshots resemble the file system layer. Thus, you can
+# snapshot any directory that is on a logical volume and you don't have
+# to worry about the actual logical volumes, mount points and paths.
+#
+# Authors
+# ~~~~~~~
+# Benjamin Schweizer <benjamin at steinle dot net>
+#
+# Changes
+# ~~~~~~~
+# 2008-09-15, benjamin: initial release.
+#
+# Todo
+# ~~~~
+# - before removal, check if the logical_volume is a snapshot device
+# - more expressive error messages
+# - recursive snapshots accross filesystem boundaries?
+#
+
+import os
+import sys
+import subprocess
+import random
+
+MOUNT_ROOT = '/var/lib/dsnapshot'
+SNAPSHOT_SIZE = '8192M'
+
+def usage():
+    print """dsnapshot/2008-09-15
+
+usage:
+    dsnapshot --test|--create|--remove <PATH> [--size=<SIZE>]
+
+    --test      test lvm
+    --create    create and mount snapshot of <PATH>
+    --remove    umount and remove snapshot where <PATH> resides in
+    --size      maxium size of snapshot volume, defaults to 8192M
+
+examples:
+    dsnapshot --test /var/log
+    dsnapshot --create /var/log
+    dsnapshot --create /var/log --size=2G
+    dsnapshot --remove /var/lib/dsnapshot/var-87hj32/...
+
+"""
+
+def get_logical_volume_path(real_path):
+    """returns device path where path resides on"""
+    st = os.stat(real_path)
+    major = os.major(st.st_dev)
+    minor = os.minor(st.st_dev)
+    
+    try:
+        sp = subprocess.Popen(['lvdisplay', '--colon'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        returncode = sp.wait()
+    except OSError, (errno, errstr):
+        raise Exception('lvdisplay-call failed with exit code %d:\n%s' % (errno, errstr))
+    if returncode:
+        raise Exception('lvdisplay-call failed with exit code %d:\n%s' % (returncode, sp.stderr.read()))
+
+    line = sp.stdout.readline()
+    if line[:-1] == '  No volume groups found':
+        raise Exception('lvdisplay-call failed: No volume groups found.')
+
+    while line:
+        # "  /dev/storage/usr:storage:3:1:-1:1:8388608:128:-1:0:0:253:1"
+        _logical_volume_path = line.split(':')[0][2:]
+        _major = int(line.split(':')[11])
+        _minor = int(line.split(':')[12])
+        if _major == major and _minor == minor:
+            return _logical_volume_path
+        line = sp.stdout.readline()
+
+    raise Exception('path is not on a logical volume')
+
+def get_relative_path(real_path):
+    """returns relative path from mount point"""
+    head = real_path
+    relative_path = ''
+
+    while not os.path.ismount(head):
+        head, tail = os.path.split(head)
+        relative_path = os.path.join(tail, relative_path)
+
+    return relative_path
+
+def create_and_mount_snapshot(original_logical_volume_path):
+    """creates and mounts a lvm2 snapshot"""
+    snapshot_logical_volume_path = "%s-%08x" % (original_logical_volume_path, random.randint(0,0xffffffff))
+    snapshot_mount_path = os.path.join(MOUNT_ROOT, os.path.basename(snapshot_logical_volume_path))
+    os.stat(original_logical_volume_path)
+
+    # create block level snapshot
+    sp = subprocess.Popen(['lvcreate', '--snapshot', '--size', SNAPSHOT_SIZE, original_logical_volume_path, '--name', snapshot_logical_volume_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    returncode = sp.wait()
+    if returncode:
+        raise Exception('lvcreate-call failed with exit code %d:\n%s' % (returncode, sp.stderr.read()))
+
+    # mount snapshot
+    os.mkdir(snapshot_mount_path, 0700)
+    sp = subprocess.Popen(['mount', snapshot_logical_volume_path, snapshot_mount_path, '-o', 'ro'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    returncode = sp.wait()
+    if returncode:
+        raise Exception('mount-call failed with exit code %d:\n%s' % (returncode, sp.stderr.read()))
+
+    return snapshot_mount_path
+
+def umount_and_remove_snapshot(snapshot_logical_volume_path, real_path):
+    """umounts and removes a lvm2 snapshot"""
+    # check if real_snapshot_mount_path was created by this script
+    snapshot_mount_path = real_path
+    while not os.path.ismount(snapshot_mount_path):
+        snapshot_mount_path, tail = os.path.split(snapshot_mount_path)
+
+    snapshot_mount_path2 = os.path.join(MOUNT_ROOT, os.path.basename(snapshot_logical_volume_path))
+
+    if snapshot_mount_path != snapshot_mount_path2:
+        raise Exception('destruction refused; looks not like my footprint')
+
+    # todo: check if snapshot_logical_volume is a snapshot
+    #   requires parsing of lvdisplay verbose output
+
+    # umount snapshot
+    sp = subprocess.Popen(['umount', snapshot_mount_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    returncode = sp.wait()
+    if returncode:
+        raise Exception('umount-call failed with exit code %d:\n%s' % (returncode, sp.stderr.read()))
+    os.rmdir(snapshot_mount_path)
+
+    # remove block level snapshot
+    sp = subprocess.Popen(['lvremove', '--force', snapshot_logical_volume_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    returncode = sp.wait()
+    if returncode:
+        raise Exception('lvremove-call failed with exit code %d:\n%s' % (returncode, sp.stderr.read()))
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        usage()
+        sys.exit(0)
+
+    mode = sys.argv[1]
+    real_path = os.path.realpath(sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[3].split('=')[0] == '--size':
+        SNAPSHOT_SIZE=sys.argv[3].split('=')[1]
+
+    # implicit checks
+    try:
+        os.stat(real_path)
+        logical_volume_path = get_logical_volume_path(real_path)
+        relative_path = get_relative_path(real_path)
+        try:
+            os.stat(MOUNT_ROOT)
+        except OSError:
+            os.mkdir(MOUNT_ROOT, 0700)
+    except Exception, e:
+        raise SystemExit(e)
+
+    if mode == '--test':
+        print "success, found %s:%s" % (logical_volume_path, relative_path)
+    elif mode == '--create':
+        try:
+            snapshot_mount_path = create_and_mount_snapshot(logical_volume_path)
+            print os.path.join(snapshot_mount_path, relative_path)
+        except Exception, e:
+            raise SystemExit(e)
+    elif mode == '--remove':
+        try:
+            umount_and_remove_snapshot(logical_volume_path, real_path)
+        except Exception, e:
+            raise SystemExit(e)
+    else:
+        usage()
+        raise SystemExit
+
+# vim: ts=4 sw=4 sts=4 et
+# eof.
